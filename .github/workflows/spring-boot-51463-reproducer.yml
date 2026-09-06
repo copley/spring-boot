@@ -7,13 +7,14 @@ on:
       - investigate-51463-nested-jar-stall
     paths:
       - '.github/workflows/spring-boot-51463-reproducer.yml'
+      - '.github/reproducers/gh-51463/**'
       - 'loader/spring-boot-loader/src/test/java/org/springframework/boot/loader/net/protocol/jar/JarUrlClassLoaderVirtualThreadStressTests.java'
 
 permissions:
   contents: read
 
 jobs:
-  stress-reproducer:
+  loader-stress:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -30,3 +31,156 @@ jobs:
           --tests org.springframework.boot.loader.net.protocol.jar.JarUrlClassLoaderVirtualThreadStressTests
           --no-daemon
           --stacktrace
+
+  executable-startup-stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Generate synthetic nested dependencies
+        working-directory: .github/reproducers/gh-51463
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          target = Path('load-libs')
+          target.mkdir(exist_ok=True)
+          payload = bytes(range(256)) * 2048
+          for jar_index in range(96):
+              jar = target / f'load-dependency-{jar_index:03d}.jar'
+              with zipfile.ZipFile(jar, 'w', compression=zipfile.ZIP_STORED) as out:
+                  for entry_index in range(32):
+                      out.writestr(
+                          f'load/{jar_index:03d}/entry-{entry_index:03d}.dat',
+                          bytes([(jar_index + entry_index) & 0xff]),
+                      )
+                  out.writestr(f'load/{jar_index:03d}/payload.bin', payload)
+          PY
+          du -sh load-libs
+      - name: Build executable reproducer
+        run: ./gradlew -p .github/reproducers/gh-51463 clean bootJar --no-daemon --stacktrace
+      - name: Exercise startup with virtual-thread actuator traffic
+        shell: bash
+        run: |
+          set -u
+          APP='.github/reproducers/gh-51463/build/libs/gh-51463-reproducer.jar'
+          DIAG="$GITHUB_WORKSPACE/gh-51463-diagnostics"
+          mkdir -p "$DIAG"
+          ls -lh "$APP" | tee "$DIAG/jar-size.txt"
+          java -version 2> "$DIAG/java-version.txt"
+
+          dump_process() {
+            local pid="$1"
+            local attempt="$2"
+            jcmd "$pid" Thread.dump_to_file -format=json "$DIAG/thread-${attempt}.json" || true
+            jcmd "$pid" Thread.print -l > "$DIAG/thread-${attempt}.txt" 2>&1 || true
+            jcmd "$pid" VM.info > "$DIAG/vm-${attempt}.txt" 2>&1 || true
+          }
+
+          cleanup() {
+            local pid="${1:-}"
+            shift || true
+            for worker in "$@"; do
+              kill "$worker" 2>/dev/null || true
+            done
+            if [ -n "$pid" ]; then
+              kill "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+            fi
+          }
+
+          reproduced=0
+          for attempt in $(seq 1 20); do
+            port=$((18080 + attempt))
+            log="$DIAG/application-${attempt}.log"
+            last_success="$DIAG/last-success-${attempt}"
+            rm -f "$last_success"
+            echo "=== attempt $attempt port $port ===" | tee -a "$DIAG/attempts.txt"
+            java -jar "$APP" --server.port="$port" > "$log" 2>&1 &
+            pid=$!
+
+            workers=()
+            for worker_index in $(seq 1 24); do
+              (
+                request=0
+                while kill -0 "$pid" 2>/dev/null; do
+                  case $((request % 4)) in
+                    0) path='/probe' ;;
+                    1) path='/actuator/health' ;;
+                    2) path='/actuator/prometheus' ;;
+                    3) path="/scan/$((worker_index * 100000 + request))" ;;
+                  esac
+                  if curl -fsS --max-time 2 "http://127.0.0.1:${port}${path}" > /dev/null 2>&1; then
+                    date +%s > "$last_success"
+                  fi
+                  request=$((request + 1))
+                done
+              ) &
+              workers+=("$!")
+            done
+
+            first_success=0
+            for _ in $(seq 1 100); do
+              if [ -s "$last_success" ]; then
+                first_success=1
+                break
+              fi
+              if ! kill -0 "$pid" 2>/dev/null; then
+                echo "application exited before serving traffic" | tee -a "$DIAG/attempts.txt"
+                break
+              fi
+              sleep 0.2
+            done
+
+            if [ "$first_success" -eq 0 ]; then
+              if kill -0 "$pid" 2>/dev/null; then
+                echo "REPRODUCED: process alive but no HTTP request completed" | tee -a "$DIAG/attempts.txt"
+                dump_process "$pid" "$attempt"
+                reproduced=1
+              else
+                echo "startup failure; see $log" | tee -a "$DIAG/attempts.txt"
+              fi
+              cleanup "$pid" "${workers[@]}"
+              [ "$reproduced" -eq 1 ] && break
+              continue
+            fi
+
+            stalled=0
+            for _ in $(seq 1 75); do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                echo "application exited after becoming responsive" | tee -a "$DIAG/attempts.txt"
+                break
+              fi
+              now=$(date +%s)
+              last=$(cat "$last_success" 2>/dev/null || echo 0)
+              if [ $((now - last)) -ge 8 ]; then
+                echo "REPRODUCED: no request completed for at least 8 seconds" | tee -a "$DIAG/attempts.txt"
+                dump_process "$pid" "$attempt"
+                stalled=1
+                reproduced=1
+                break
+              fi
+              sleep 0.2
+            done
+
+            cleanup "$pid" "${workers[@]}"
+            [ "$stalled" -eq 1 ] && break
+          done
+
+          if [ "$reproduced" -eq 1 ]; then
+            echo 'gh-51463 stall reproduced; diagnostic dump captured'
+            exit 1
+          fi
+          echo 'No stall reproduced in 20 startup attempts'
+      - name: Upload reproduction diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh-51463-diagnostics
+          path: gh-51463-diagnostics
+          if-no-files-found: warn
