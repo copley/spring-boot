@@ -9,12 +9,99 @@ on:
       - '.github/workflows/spring-boot-51463-reproducer.yml'
       - '.github/reproducers/gh-51463/**'
       - 'loader/spring-boot-loader/src/test/java/org/springframework/boot/loader/jar/NestedJarFileFileAccessLockConvoyTests.java'
+      - 'loader/spring-boot-loader/src/test/java/org/springframework/boot/loader/jar/NestedJarFileFileAccessLockConvoyRegressionTests.java'
       - 'loader/spring-boot-loader/src/test/java/org/springframework/boot/loader/net/protocol/jar/JarUrlClassLoaderVirtualThreadStressTests.java'
 
 permissions:
   contents: read
 
 jobs:
+  regression-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Verify current baseline fails for the lock-convoy assertion
+        shell: bash
+        run: |
+          set -o pipefail
+          rm -rf loader/spring-boot-loader/build/test-results/test
+          set +e
+          ./gradlew :loader:spring-boot-loader:test \
+            --tests org.springframework.boot.loader.jar.NestedJarFileFileAccessLockConvoyRegressionTests \
+            --rerun-tasks \
+            --no-daemon \
+            --stacktrace 2>&1 | tee gh-51463-baseline-regression.log
+          baseline_status=${PIPESTATUS[0]}
+          set -e
+          if [ "$baseline_status" -eq 0 ]; then
+            echo 'Expected current NestedJarFile baseline to fail the gh-51463 regression contract, but it passed.'
+            exit 1
+          fi
+          if ! grep -R -F -q \
+            'GH-51463 regression: independent NestedJarFile metadata reads must not wait behind a stalled FileAccess read' \
+            loader/spring-boot-loader/build/test-results/test; then
+            echo 'Baseline failed, but not for the expected gh-51463 lock-convoy assertion.'
+            exit 1
+          fi
+          echo 'BASELINE-FAIL CONFIRMED: independent metadata read is serialized behind stalled FileAccess work.'
+      - name: Apply temporary causal probe to NestedJarFile read path
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('loader/spring-boot-loader/src/main/java/org/springframework/boot/loader/jar/NestedJarFile.java')
+          text = path.read_text()
+          old = """\t\tsynchronized (this) {
+          \t\t\tensureOpen();
+          \t\t\treturn this.resources.zipContent().hasEntry(null, name);
+          \t\t}
+          """
+          new = """\t\tensureOpen();
+          \t\treturn this.resources.zipContent().hasEntry(null, name);
+          """
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'Expected exactly one hasEntry synchronized block, found {count}')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          git diff --check
+          git diff -- loader/spring-boot-loader/src/main/java/org/springframework/boot/loader/jar/NestedJarFile.java
+      - name: Verify the same regression contract passes with the temporary probe
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew :loader:spring-boot-loader:test \
+            --tests org.springframework.boot.loader.jar.NestedJarFileFileAccessLockConvoyRegressionTests \
+            --rerun-tasks \
+            --no-daemon \
+            --stacktrace 2>&1 | tee gh-51463-patched-regression.log
+          echo 'PATCHED-PASS CONFIRMED: removing the outer hasEntry monitor breaks the lock convoy.'
+      - name: Restore production source
+        if: always()
+        shell: bash
+        run: |
+          git checkout -- loader/spring-boot-loader/src/main/java/org/springframework/boot/loader/jar/NestedJarFile.java
+          if ! git diff --quiet -- loader/spring-boot-loader/src/main/java/org/springframework/boot/loader/jar/NestedJarFile.java; then
+            echo 'NestedJarFile.java was not restored cleanly.'
+            git diff -- loader/spring-boot-loader/src/main/java/org/springframework/boot/loader/jar/NestedJarFile.java
+            exit 1
+          fi
+      - name: Upload regression-contract logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh-51463-regression-contract
+          path: |
+            gh-51463-baseline-regression.log
+            gh-51463-patched-regression.log
+          if-no-files-found: warn
+
   causal-lock-convoy:
     runs-on: ubuntu-latest
     timeout-minutes: 15
