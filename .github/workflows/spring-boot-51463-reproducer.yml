@@ -105,15 +105,43 @@ jobs:
           java -version 2> "$DIAG/java-version.txt"
           echo "loader.path=$LOADER_PATH" > "$DIAG/launcher.txt"
 
+          capture_jcmd() {
+            local pid="$1"
+            local output="$2"
+            shift 2
+            local status=0
+            timeout --signal=TERM --kill-after=2s 10s jcmd "$pid" "$@" > "$output" 2>&1 || status=$?
+            if [ "$status" -ne 0 ]; then
+              echo "jcmd failed or timed out: pid=$pid status=$status command=$*" | tee -a "$DIAG/jcmd-errors.txt"
+            fi
+            return "$status"
+          }
+
+          terminate_pid() {
+            local pid="$1"
+            local label="$2"
+            local grace_seconds="${3:-5}"
+            if ! kill -0 "$pid" 2>/dev/null; then
+              wait "$pid" 2>/dev/null || true
+              return
+            fi
+            kill -TERM "$pid" 2>/dev/null || true
+            if ! timeout "${grace_seconds}s" tail --pid="$pid" -f /dev/null > /dev/null 2>&1; then
+              echo "$label pid $pid did not exit after ${grace_seconds}s; sending SIGKILL" | tee -a "$DIAG/cleanup.txt"
+              kill -KILL "$pid" 2>/dev/null || true
+              timeout 2s tail --pid="$pid" -f /dev/null > /dev/null 2>&1 || true
+            fi
+            wait "$pid" 2>/dev/null || true
+          }
+
           cleanup() {
             local pid="${1:-}"
             shift || true
             for worker in "$@"; do
-              kill "$worker" 2>/dev/null || true
+              terminate_pid "$worker" worker 2
             done
             if [ -n "$pid" ]; then
-              kill "$pid" 2>/dev/null || true
-              wait "$pid" 2>/dev/null || true
+              terminate_pid "$pid" application 5
             fi
           }
 
@@ -150,16 +178,16 @@ jobs:
               sleep 5
               curl -fsS --max-time 2 "http://127.0.0.1:${port}/progress" \
                 > "$DIAG/progress-${attempt}-${snapshot}.txt" 2>/dev/null || true
-              jcmd "$pid" Thread.dump_to_file -format=json \
-                "$DIAG/thread-${attempt}-${snapshot}.json" > /dev/null 2>&1 || true
+              capture_jcmd "$pid" "$DIAG/jcmd-thread-${attempt}-${snapshot}.log" \
+                Thread.dump_to_file -format=json "$DIAG/thread-${attempt}-${snapshot}.json" || true
             done
 
             analysis_status=0
             python3 "$ANALYZER" "$DIAG" | tee "$DIAG/analysis-${attempt}.txt" || analysis_status=$?
             if [ "$analysis_status" -eq 2 ]; then
               echo "REPRODUCED: persistent FileDataBlock/NestedJarFile signature" | tee -a "$DIAG/attempts.txt"
-              jcmd "$pid" Thread.print -l > "$DIAG/final-thread-${attempt}.txt" 2>&1 || true
-              jcmd "$pid" VM.info > "$DIAG/vm-${attempt}.txt" 2>&1 || true
+              capture_jcmd "$pid" "$DIAG/final-thread-${attempt}.txt" Thread.print -l || true
+              capture_jcmd "$pid" "$DIAG/vm-${attempt}.txt" VM.info || true
               reproduced=1
             else
               echo "No production signature in attempt $attempt" | tee -a "$DIAG/attempts.txt"
