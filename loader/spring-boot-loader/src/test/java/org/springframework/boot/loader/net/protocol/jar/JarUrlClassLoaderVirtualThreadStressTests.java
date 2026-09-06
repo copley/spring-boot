@@ -95,7 +95,10 @@ class JarUrlClassLoaderVirtualThreadStressTests {
 			List<Future<?>> futures = new ArrayList<>(WORKER_COUNT);
 			for (int worker = 0; worker < WORKER_COUNT; worker++) {
 				int workerIndex = worker;
-				futures.add(executor.submit(() -> exerciseLoader(loader, start, progress, workerIndex)));
+				futures.add(executor.submit(() -> {
+					exerciseLoader(loader, start, progress, workerIndex);
+					return null;
+				}));
 			}
 			start.countDown();
 			awaitCompletion(futures, progress);
