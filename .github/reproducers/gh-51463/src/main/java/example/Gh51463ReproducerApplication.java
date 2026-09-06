@@ -20,6 +20,7 @@ import java.io.InputStream;
 import java.net.URL;
 import java.time.Duration;
 import java.util.Enumeration;
+import java.util.concurrent.atomic.AtomicLong;
 
 import javax.xml.stream.XMLOutputFactory;
 
@@ -50,9 +51,18 @@ public class Gh51463ReproducerApplication {
 
 	private final Object fingerprintMonitor = new Object();
 
+	private final AtomicLong fingerprintPasses = new AtomicLong();
+
+	private final AtomicLong healthPasses = new AtomicLong();
+
 	@GetMapping("/probe")
 	Resource probe() {
 		return new ClassPathResource("gh-51463/probe.txt");
+	}
+
+	@GetMapping("/progress")
+	String progress() {
+		return "fingerprint=" + this.fingerprintPasses.get() + ",health=" + this.healthPasses.get();
 	}
 
 	@Bean
@@ -63,6 +73,7 @@ public class Gh51463ReproducerApplication {
 				// classpath resource discovery while the application is still starting.
 				XMLOutputFactory.newFactory();
 				readAll("META-INF/gh-51463/common.dat");
+				this.healthPasses.incrementAndGet();
 				return Health.up().build();
 			}
 			catch (Exception ex) {
@@ -74,9 +85,10 @@ public class Gh51463ReproducerApplication {
 	@Bean
 	ApplicationRunner startupFingerprinting() {
 		return (args) -> {
-			long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+			long deadline = System.nanoTime() + Duration.ofSeconds(45).toNanos();
 			while (System.nanoTime() < deadline) {
 				fingerprintClasspath();
+				this.fingerprintPasses.incrementAndGet();
 			}
 		};
 	}
@@ -95,7 +107,7 @@ public class Gh51463ReproducerApplication {
 			URL resource = resources.nextElement();
 			try (InputStream input = resource.openStream()) {
 				while (input.read(buffer) != -1) {
-				}	// Drain the resource to exercise NestedJarFile/FileDataBlock reads.
+					// Drain the resource to exercise NestedJarFile/FileDataBlock reads.
 				}
 			}
 		}
