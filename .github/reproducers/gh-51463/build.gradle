@@ -22,4 +22,7 @@ dependencies {
 
 tasks.named("bootJar") {
 	archiveFileName = "gh-51463-reproducer.jar"
+	manifest {
+		attributes "Main-Class": "org.springframework.boot.loader.launch.PropertiesLauncher"
+	}
 }
