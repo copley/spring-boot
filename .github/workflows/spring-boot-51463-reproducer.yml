@@ -8,12 +8,29 @@ on:
     paths:
       - '.github/workflows/spring-boot-51463-reproducer.yml'
       - '.github/reproducers/gh-51463/**'
+      - 'loader/spring-boot-loader/src/test/java/org/springframework/boot/loader/jar/NestedJarFileFileAccessLockConvoyTests.java'
       - 'loader/spring-boot-loader/src/test/java/org/springframework/boot/loader/net/protocol/jar/JarUrlClassLoaderVirtualThreadStressTests.java'
 
 permissions:
   contents: read
 
 jobs:
+  causal-lock-convoy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Demonstrate FileAccess to NestedJarFile lock convoy
+        run: >-
+          ./gradlew :loader:spring-boot-loader:test
+          --tests org.springframework.boot.loader.jar.NestedJarFileFileAccessLockConvoyTests
+          --no-daemon
+          --info
+
   loader-stress:
     runs-on: ubuntu-latest
     timeout-minutes: 20
