@@ -1,0 +1,32 @@
+name: Spring Boot 51463 reproducer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - investigate-51463-nested-jar-stall
+    paths:
+      - '.github/workflows/spring-boot-51463-reproducer.yml'
+      - 'loader/spring-boot-loader/src/test/java/org/springframework/boot/loader/net/protocol/jar/JarUrlClassLoaderVirtualThreadStressTests.java'
+
+permissions:
+  contents: read
+
+jobs:
+  stress-reproducer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Run nested JAR virtual-thread stress reproducer
+        env:
+          SPRING_BOOT_GH51463_STRESS: 'true'
+        run: >-
+          ./gradlew :loader:spring-boot-loader:test
+          --tests org.springframework.boot.loader.net.protocol.jar.JarUrlClassLoaderVirtualThreadStressTests
+          --no-daemon
+          --stacktrace
