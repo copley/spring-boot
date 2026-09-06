@@ -286,9 +286,12 @@ jobs:
 
           if [ "$reproduced" -eq 1 ]; then
             echo 'gh-51463 production-shaped failure signature reproduced'
-            exit 1
+            echo '### GH-51463 baseline production-shape reproduction: CONFIRMED' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           echo 'No production-shaped gh-51463 signature reproduced in three attempts'
+          echo '### GH-51463 baseline production-shape reproduction: NOT REPRODUCED' >> "$GITHUB_STEP_SUMMARY"
+          exit 1
       - name: Upload reproduction diagnostics
         if: always()
         uses: actions/upload-artifact@v4
