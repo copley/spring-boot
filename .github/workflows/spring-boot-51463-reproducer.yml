@@ -95,7 +95,7 @@ jobs:
           }
 
           reproduced=0
-          for attempt in $(seq 1 20); do
+          for attempt in $(seq 1 12); do
             port=$((18080 + attempt))
             log="$DIAG/application-${attempt}.log"
             last_success="$DIAG/last-success-${attempt}"
@@ -124,8 +124,11 @@ jobs:
               workers+=("$!")
             done
 
+            # A 72 MB executable JAR takes roughly 25-30 seconds to reach the
+            # embedded server on the hosted runner even without a stall. Give normal
+            # startup a full minute before treating lack of progress as suspicious.
             first_success=0
-            for _ in $(seq 1 100); do
+            for _ in $(seq 1 300); do
               if [ -s "$last_success" ]; then
                 first_success=1
                 break
@@ -139,7 +142,7 @@ jobs:
 
             if [ "$first_success" -eq 0 ]; then
               if kill -0 "$pid" 2>/dev/null; then
-                echo "REPRODUCED: process alive but no HTTP request completed" | tee -a "$DIAG/attempts.txt"
+                echo "REPRODUCED: process alive but no HTTP request completed after 60 seconds" | tee -a "$DIAG/attempts.txt"
                 dump_process "$pid" "$attempt"
                 reproduced=1
               else
@@ -159,7 +162,7 @@ jobs:
               now=$(date +%s)
               last=$(cat "$last_success" 2>/dev/null || echo 0)
               if [ $((now - last)) -ge 8 ]; then
-                echo "REPRODUCED: no request completed for at least 8 seconds" | tee -a "$DIAG/attempts.txt"
+                echo "REPRODUCED: no request completed for at least 8 seconds after initial responsiveness" | tee -a "$DIAG/attempts.txt"
                 dump_process "$pid" "$attempt"
                 stalled=1
                 reproduced=1
@@ -176,7 +179,7 @@ jobs:
             echo 'gh-51463 stall reproduced; diagnostic dump captured'
             exit 1
           fi
-          echo 'No stall reproduced in 20 startup attempts'
+          echo 'No stall reproduced in 12 startup attempts'
       - name: Upload reproduction diagnostics
         if: always()
         uses: actions/upload-artifact@v4
