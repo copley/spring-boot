@@ -104,9 +104,18 @@ class NestedJarFileFileAccessLockConvoyTests {
 	}
 
 	private Object readField(Object instance, String name) throws Exception {
-		Field field = instance.getClass().getDeclaredField(name);
-		field.setAccessible(true);
-		return field.get(instance);
+		Class<?> type = instance.getClass();
+		while (type != null) {
+			try {
+				Field field = type.getDeclaredField(name);
+				field.setAccessible(true);
+				return field.get(instance);
+			}
+			catch (NoSuchFieldException ex) {
+				type = type.getSuperclass();
+			}
+		}
+		throw new NoSuchFieldException(name);
 	}
 
 	private void holdLock(Object lock, CountDownLatch lockHeld, CountDownLatch releaseLock) {
