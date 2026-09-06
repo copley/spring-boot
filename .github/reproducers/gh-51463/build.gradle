@@ -1,0 +1,25 @@
+plugins {
+	id "java"
+	id "org.springframework.boot" version "4.1.0"
+}
+
+java {
+	sourceCompatibility = "25"
+	targetCompatibility = "25"
+}
+
+repositories {
+	mavenCentral()
+}
+
+dependencies {
+	implementation(platform("org.springframework.boot:spring-boot-dependencies:4.1.0"))
+	implementation("org.springframework.boot:spring-boot-starter-webmvc")
+	implementation("org.springframework.boot:spring-boot-starter-actuator")
+	runtimeOnly("io.micrometer:micrometer-registry-prometheus")
+	implementation(fileTree(dir: "load-libs", include: ["*.jar"]))
+}
+
+tasks.named("bootJar") {
+	archiveFileName = "gh-51463-reproducer.jar"
+}
