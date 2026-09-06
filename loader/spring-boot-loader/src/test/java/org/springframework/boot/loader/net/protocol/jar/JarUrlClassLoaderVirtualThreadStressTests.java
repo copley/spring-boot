@@ -51,8 +51,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Stress reproducer for gh-51463. This test intentionally makes no production-code
- * changes. It exercises concurrent resource lookup and reads from one large nested JAR
- * using virtual threads, matching the loader path reported by affected applications.
+ * changes. It exercises concurrent resource lookup and reads across many nested JARs in
+ * one executable-style archive using virtual threads. Missing and late-classpath
+ * resource lookups force concurrent traversal of many nested JARs backed by the same
+ * outer file, matching the loader pressure reported by affected applications.
  *
  * @author Max Copley
  */
@@ -60,15 +62,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 @EnabledIfEnvironmentVariable(named = "SPRING_BOOT_GH51463_STRESS", matches = "true")
 class JarUrlClassLoaderVirtualThreadStressTests {
 
-	private static final int ENTRY_COUNT = 12000;
+	private static final int NESTED_JAR_COUNT = 64;
+
+	private static final int ENTRIES_PER_NESTED_JAR = 256;
 
 	private static final int WORKER_COUNT = 256;
 
-	private static final int OPERATIONS_PER_WORKER = 1000;
+	private static final int OPERATIONS_PER_WORKER = 500;
 
-	private static final Duration NO_PROGRESS_TIMEOUT = Duration.ofSeconds(15);
+	private static final Duration NO_PROGRESS_TIMEOUT = Duration.ofSeconds(20);
 
-	private static final Duration OVERALL_TIMEOUT = Duration.ofSeconds(90);
+	private static final Duration OVERALL_TIMEOUT = Duration.ofSeconds(120);
 
 	@TempDir
 	File tempDir;
@@ -86,11 +90,10 @@ class JarUrlClassLoaderVirtualThreadStressTests {
 	@Test
 	void concurrentNestedJarAccessFromVirtualThreadsContinuesToMakeProgress() throws Exception {
 		File jarFile = new File(this.tempDir, "application.jar");
-		createLargeNestedJar(jarFile);
-		URL nestedJarUrl = JarUrl.create(jarFile, "BOOT-INF/lib/large.jar");
+		URL[] nestedJarUrls = createApplicationJar(jarFile);
 		AtomicLong progress = new AtomicLong();
 		ExecutorService executor = newVirtualThreadPerTaskExecutor();
-		try (JarUrlClassLoader loader = new TestJarUrlClassLoader(nestedJarUrl)) {
+		try (JarUrlClassLoader loader = new TestJarUrlClassLoader(nestedJarUrls)) {
 			CountDownLatch start = new CountDownLatch(1);
 			List<Future<?>> futures = new ArrayList<>(WORKER_COUNT);
 			for (int worker = 0; worker < WORKER_COUNT; worker++) {
@@ -117,12 +120,13 @@ class JarUrlClassLoaderVirtualThreadStressTests {
 			throws Exception {
 		start.await();
 		for (int operation = 0; operation < OPERATIONS_PER_WORKER; operation++) {
-			int entryIndex = Math.floorMod(worker * 8191 + operation * 131, ENTRY_COUNT);
-			String entryName = "entries/entry-%05d.dat".formatted(entryIndex);
+			int jarIndex = Math.floorMod(worker * 31 + operation * 17, NESTED_JAR_COUNT);
+			int entryIndex = Math.floorMod(worker * 8191 + operation * 131, ENTRIES_PER_NESTED_JAR);
+			String entryName = entryName(jarIndex, entryIndex);
 			switch (operation & 3) {
 				case 0 -> assertThat(loader.getResource(entryName)).isNotNull();
 				case 1 -> assertThat(loader.getResource("missing/entry-%05d.dat".formatted(entryIndex))).isNull();
-				case 2 -> readResource(loader, entryName, entryIndex);
+				case 2 -> readResource(loader, entryName, jarIndex, entryIndex);
 				case 3 -> enumerateResource(loader, entryName);
 				default -> throw new IllegalStateException("Unexpected operation");
 			}
@@ -130,11 +134,11 @@ class JarUrlClassLoaderVirtualThreadStressTests {
 		}
 	}
 
-	private void readResource(JarUrlClassLoader loader, String entryName, int entryIndex) throws Exception {
+	private void readResource(JarUrlClassLoader loader, String entryName, int jarIndex, int entryIndex) throws Exception {
 		URL resource = loader.getResource(entryName);
 		assertThat(resource).isNotNull();
 		try (InputStream inputStream = resource.openStream()) {
-			assertThat(inputStream.read()).isEqualTo(entryIndex & 0xff);
+			assertThat(inputStream.read()).isEqualTo((jarIndex + entryIndex) & 0xff);
 		}
 	}
 
@@ -142,6 +146,7 @@ class JarUrlClassLoaderVirtualThreadStressTests {
 		Enumeration<URL> resources = loader.getResources(entryName);
 		assertThat(resources.hasMoreElements()).isTrue();
 		assertThat(resources.nextElement()).isNotNull();
+		assertThat(resources.hasMoreElements()).isFalse();
 	}
 
 	private void awaitCompletion(List<Future<?>> futures, AtomicLong progress) throws Exception {
@@ -193,32 +198,46 @@ class JarUrlClassLoaderVirtualThreadStressTests {
 		}
 	}
 
-	private void createLargeNestedJar(File jarFile) throws Exception {
-		byte[] nestedJar = createNestedJar();
+	private URL[] createApplicationJar(File jarFile) throws Exception {
+		URL[] urls = new URL[NESTED_JAR_COUNT];
 		try (JarOutputStream out = new JarOutputStream(new FileOutputStream(jarFile))) {
-			JarEntry nestedEntry = new JarEntry("BOOT-INF/lib/large.jar");
-			nestedEntry.setMethod(ZipEntry.STORED);
-			nestedEntry.setSize(nestedJar.length);
-			nestedEntry.setCompressedSize(nestedJar.length);
-			CRC32 crc = new CRC32();
-			crc.update(nestedJar);
-			nestedEntry.setCrc(crc.getValue());
-			out.putNextEntry(nestedEntry);
-			out.write(nestedJar);
-			out.closeEntry();
+			for (int jarIndex = 0; jarIndex < NESTED_JAR_COUNT; jarIndex++) {
+				String nestedJarName = "BOOT-INF/lib/dependency-%03d.jar".formatted(jarIndex);
+				byte[] nestedJar = createNestedJar(jarIndex);
+				writeStoredEntry(out, nestedJarName, nestedJar);
+				urls[jarIndex] = JarUrl.create(jarFile, nestedJarName);
+			}
 		}
+		return urls;
 	}
 
-	private byte[] createNestedJar() throws Exception {
+	private byte[] createNestedJar(int jarIndex) throws Exception {
 		ByteArrayOutputStream bytes = new ByteArrayOutputStream();
 		try (JarOutputStream out = new JarOutputStream(bytes)) {
-			for (int i = 0; i < ENTRY_COUNT; i++) {
-				out.putNextEntry(new JarEntry("entries/entry-%05d.dat".formatted(i)));
-				out.write(i & 0xff);
+			for (int entryIndex = 0; entryIndex < ENTRIES_PER_NESTED_JAR; entryIndex++) {
+				out.putNextEntry(new JarEntry(entryName(jarIndex, entryIndex)));
+				out.write((jarIndex + entryIndex) & 0xff);
 				out.closeEntry();
 			}
 		}
 		return bytes.toByteArray();
+	}
+
+	private void writeStoredEntry(JarOutputStream out, String name, byte[] data) throws Exception {
+		JarEntry nestedEntry = new JarEntry(name);
+		nestedEntry.setMethod(ZipEntry.STORED);
+		nestedEntry.setSize(data.length);
+		nestedEntry.setCompressedSize(data.length);
+		CRC32 crc = new CRC32();
+		crc.update(data);
+		nestedEntry.setCrc(crc.getValue());
+		out.putNextEntry(nestedEntry);
+		out.write(data);
+		out.closeEntry();
+	}
+
+	private String entryName(int jarIndex, int entryIndex) {
+		return "jar-%03d/entry-%05d.dat".formatted(jarIndex, entryIndex);
 	}
 
 	private static class TestJarUrlClassLoader extends JarUrlClassLoader {
