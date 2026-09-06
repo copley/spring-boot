@@ -32,7 +32,7 @@ jobs:
           --no-daemon
           --stacktrace
 
-  executable-startup-stress:
+  production-shape-reproducer:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -41,46 +41,52 @@ jobs:
         with:
           distribution: temurin
           java-version: '25'
-      - name: Generate synthetic nested dependencies
+      - name: Generate large nested and loader.path archives
         working-directory: .github/reproducers/gh-51463
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import zipfile
 
-          target = Path('load-libs')
-          target.mkdir(exist_ok=True)
+          nested = Path('load-libs')
+          external = Path('loader-path')
+          nested.mkdir(exist_ok=True)
+          external.mkdir(exist_ok=True)
           payload = bytes(range(256)) * 2048
+          common = bytes(range(256)) * 256
+
           for jar_index in range(96):
-              jar = target / f'load-dependency-{jar_index:03d}.jar'
+              jar = nested / f'load-dependency-{jar_index:03d}.jar'
               with zipfile.ZipFile(jar, 'w', compression=zipfile.ZIP_STORED) as out:
+                  out.writestr('META-INF/gh-51463/common.dat', common)
                   for entry_index in range(32):
                       out.writestr(
                           f'load/{jar_index:03d}/entry-{entry_index:03d}.dat',
                           bytes([(jar_index + entry_index) & 0xff]),
                       )
                   out.writestr(f'load/{jar_index:03d}/payload.bin', payload)
+
+          for jar_index in range(24):
+              jar = external / f'external-dependency-{jar_index:03d}.jar'
+              with zipfile.ZipFile(jar, 'w', compression=zipfile.ZIP_STORED) as out:
+                  out.writestr('META-INF/gh-51463/common.dat', common)
+                  out.writestr(f'external/{jar_index:03d}/payload.bin', payload)
           PY
-          du -sh load-libs
-      - name: Build executable reproducer
+          du -sh load-libs loader-path
+      - name: Build PropertiesLauncher executable reproducer
         run: ./gradlew -p .github/reproducers/gh-51463 clean bootJar --no-daemon --stacktrace
-      - name: Exercise startup with virtual-thread actuator traffic
+      - name: Exercise production-shaped startup and capture structural evidence
         shell: bash
         run: |
           set -u
           APP='.github/reproducers/gh-51463/build/libs/gh-51463-reproducer.jar'
+          LOADER_PATH="$GITHUB_WORKSPACE/.github/reproducers/gh-51463/loader-path/"
           DIAG="$GITHUB_WORKSPACE/gh-51463-diagnostics"
+          ANALYZER="$GITHUB_WORKSPACE/.github/reproducers/gh-51463/analyze_dumps.py"
           mkdir -p "$DIAG"
           ls -lh "$APP" | tee "$DIAG/jar-size.txt"
           java -version 2> "$DIAG/java-version.txt"
-
-          dump_process() {
-            local pid="$1"
-            local attempt="$2"
-            jcmd "$pid" Thread.dump_to_file -format=json "$DIAG/thread-${attempt}.json" || true
-            jcmd "$pid" Thread.print -l > "$DIAG/thread-${attempt}.txt" 2>&1 || true
-            jcmd "$pid" VM.info > "$DIAG/vm-${attempt}.txt" 2>&1 || true
-          }
+          echo "loader.path=$LOADER_PATH" > "$DIAG/launcher.txt"
 
           cleanup() {
             local pid="${1:-}"
@@ -95,13 +101,11 @@ jobs:
           }
 
           reproduced=0
-          for attempt in $(seq 1 12); do
+          for attempt in $(seq 1 3); do
             port=$((18080 + attempt))
             log="$DIAG/application-${attempt}.log"
-            last_success="$DIAG/last-success-${attempt}"
-            rm -f "$last_success"
             echo "=== attempt $attempt port $port ===" | tee -a "$DIAG/attempts.txt"
-            java -jar "$APP" --server.port="$port" > "$log" 2>&1 &
+            java -Dloader.path="$LOADER_PATH" -jar "$APP" --server.port="$port" > "$log" 2>&1 &
             pid=$!
 
             workers=()
@@ -109,81 +113,54 @@ jobs:
               (
                 request=0
                 while kill -0 "$pid" 2>/dev/null; do
-                  case $((request % 4)) in
+                  case $((request % 3)) in
                     0) path='/probe' ;;
                     1) path='/actuator/health' ;;
                     2) path='/actuator/prometheus' ;;
-                    3) path="/scan/$((worker_index * 100000 + request))" ;;
                   esac
-                  if curl -fsS --max-time 2 "http://127.0.0.1:${port}${path}" > /dev/null 2>&1; then
-                    date +%s > "$last_success"
-                  fi
+                  curl -fsS --max-time 3 "http://127.0.0.1:${port}${path}" > /dev/null 2>&1 || true
                   request=$((request + 1))
                 done
               ) &
               workers+=("$!")
             done
 
-            # A 72 MB executable JAR takes roughly 25-30 seconds to reach the
-            # embedded server on the hosted runner even without a stall. Give normal
-            # startup a full minute before treating lack of progress as suspicious.
-            first_success=0
-            for _ in $(seq 1 300); do
-              if [ -s "$last_success" ]; then
-                first_success=1
-                break
-              fi
+            for snapshot in $(seq 1 18); do
               if ! kill -0 "$pid" 2>/dev/null; then
-                echo "application exited before serving traffic" | tee -a "$DIAG/attempts.txt"
+                echo "application exited during snapshot window" | tee -a "$DIAG/attempts.txt"
                 break
               fi
-              sleep 0.2
+              sleep 5
+              curl -fsS --max-time 2 "http://127.0.0.1:${port}/progress" \
+                > "$DIAG/progress-${attempt}-${snapshot}.txt" 2>/dev/null || true
+              jcmd "$pid" Thread.dump_to_file -format=json \
+                "$DIAG/thread-${attempt}-${snapshot}.json" > /dev/null 2>&1 || true
             done
 
-            if [ "$first_success" -eq 0 ]; then
-              if kill -0 "$pid" 2>/dev/null; then
-                echo "REPRODUCED: process alive but no HTTP request completed after 60 seconds" | tee -a "$DIAG/attempts.txt"
-                dump_process "$pid" "$attempt"
-                reproduced=1
-              else
-                echo "startup failure; see $log" | tee -a "$DIAG/attempts.txt"
-              fi
-              cleanup "$pid" "${workers[@]}"
-              [ "$reproduced" -eq 1 ] && break
-              continue
+            analysis_status=0
+            python3 "$ANALYZER" "$DIAG" | tee "$DIAG/analysis-${attempt}.txt" || analysis_status=$?
+            if [ "$analysis_status" -eq 2 ]; then
+              echo "REPRODUCED: persistent FileDataBlock/NestedJarFile signature" | tee -a "$DIAG/attempts.txt"
+              jcmd "$pid" Thread.print -l > "$DIAG/final-thread-${attempt}.txt" 2>&1 || true
+              jcmd "$pid" VM.info > "$DIAG/vm-${attempt}.txt" 2>&1 || true
+              reproduced=1
+            else
+              echo "No production signature in attempt $attempt" | tee -a "$DIAG/attempts.txt"
             fi
 
-            stalled=0
-            for _ in $(seq 1 75); do
-              if ! kill -0 "$pid" 2>/dev/null; then
-                echo "application exited after becoming responsive" | tee -a "$DIAG/attempts.txt"
-                break
-              fi
-              now=$(date +%s)
-              last=$(cat "$last_success" 2>/dev/null || echo 0)
-              if [ $((now - last)) -ge 8 ]; then
-                echo "REPRODUCED: no request completed for at least 8 seconds after initial responsiveness" | tee -a "$DIAG/attempts.txt"
-                dump_process "$pid" "$attempt"
-                stalled=1
-                reproduced=1
-                break
-              fi
-              sleep 0.2
-            done
-
             cleanup "$pid" "${workers[@]}"
-            [ "$stalled" -eq 1 ] && break
+            [ "$reproduced" -eq 1 ] && break
           done
 
           if [ "$reproduced" -eq 1 ]; then
-            echo 'gh-51463 stall reproduced; diagnostic dump captured'
+            echo 'gh-51463 production-shaped failure signature reproduced'
             exit 1
           fi
-          echo 'No stall reproduced in 12 startup attempts'
+          echo 'No production-shaped gh-51463 signature reproduced in three attempts'
       - name: Upload reproduction diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gh-51463-diagnostics
+          name: gh-51463-production-shape-diagnostics
           path: gh-51463-diagnostics
           if-no-files-found: warn
